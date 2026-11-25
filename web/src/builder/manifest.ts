@@ -27,6 +27,9 @@ export const RAW = `https://raw.githubusercontent.com/${INDEX.owner}/${INDEX.rep
 export interface Library { name: string; download_url: string; sha256: string; filename: string }
 export interface Artifact { targets: string[]; download_url: string; sha256: string; library_dependencies: Library[] }
 export interface Dependency { id: string; version: string }
+export interface Incompatibility { id: string; note: string; below: string }
+export const NOTE_MAX = 300
+export const CHANGELOG_MAX = 2000
 export interface State {
   owner: string
   repo: string
@@ -34,21 +37,27 @@ export interface State {
   name: string
   author: string
   description: string
+  changelog: string
   parity: boolean
   scenes: string[]
   dependencies: Dependency[]
+  incompatible: Incompatibility[]
   icons: Record<number, string>   // size -> link
   screenshots: string[]
   artifacts: Artifact[]
 }
-// repository.json's "mods": id -> major -> { versions, ... }
-export type IndexMods = Record<string, Record<string, { versions?: string[] }>>
+// repository.json's "mods": id -> major -> what that major's highest version says.
+export interface IndexEntry { versions?: string[]; name?: string; author?: string; icons?: { size: number; url: string }[] }
+export type IndexMods = Record<string, Record<string, IndexEntry>>
+
+// One suggestion in a search field: the value it fills in, and how it's shown.
+export interface Choice { value: string; label?: string; detail?: string; icon?: string }
 
 export const blankArtifact = (): Artifact => ({ targets: [], download_url: "", sha256: "", library_dependencies: [] })
 export const blankLibrary = (): Library => ({ name: "", download_url: "", sha256: "", filename: "" })
 export const blankState = (): State => ({
-  owner: "", repo: "", version: "", name: "", author: "", description: "",
-  parity: true, scenes: [], dependencies: [], icons: {}, screenshots: [], artifacts: [blankArtifact()],
+  owner: "", repo: "", version: "", name: "", author: "", description: "", changelog: "",
+  parity: true, scenes: [], dependencies: [], incompatible: [], icons: {}, screenshots: [], artifacts: [blankArtifact()],
 })
 
 type VKey = number[]
@@ -59,6 +68,37 @@ export const publishedOf = (mods: IndexMods | null, id: string) => Object.values
   .flatMap((e) => e.versions || []).filter((v) => VERSION_RE.test(v)).sort((a, b) => vcmp(vkey(b), vkey(a)))
 
 export const splitId = (id: string) => id.split(/\.(.*)/s)
+
+// The newest major's entry, which says what the mod is called now.
+const newest = (mods: IndexMods, id: string) => {
+  const majors = Object.keys(mods[id] || {}).filter((m) => /^\d+$/.test(m)).sort((a, b) => Number(b) - Number(a))
+  return majors.length ? mods[id][majors[0]] : undefined
+}
+const smallIcon = (e?: IndexEntry) => (Array.isArray(e?.icons) ? [...e.icons].sort((a, b) => a.size - b.size)[0]?.url : undefined)
+
+// Every published mod but `except`, by name.
+export function modChoices(mods: IndexMods | null, except = ""): Choice[] {
+  return Object.keys(mods || {}).filter((id) => id.toLowerCase() !== except.toLowerCase()).map((id) => {
+    const e = newest(mods!, id), latest = publishedOf(mods, id)[0]
+    return { value: id, label: e?.name || id, detail: [e?.author && `by ${e.author}`, latest && `latest ${latest}`].filter(Boolean).join(", "), icon: smallIcon(e) }
+  }).sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }))
+}
+
+// A mod's published versions, highest first.
+export const versionChoices = (mods: IndexMods | null, id: string): Choice[] =>
+  publishedOf(mods, id).map((v, i) => ({ value: v, detail: i === 0 ? "latest" : undefined }))
+
+export function ownerChoices(mods: IndexMods | null): Choice[] {
+  const count: Record<string, number> = {}
+  for (const id of Object.keys(mods || {})) count[splitId(id)[0]] = (count[splitId(id)[0]] || 0) + 1
+  return Object.keys(count).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }))
+    .map((o) => ({ value: o, detail: `${count[o]} mod${count[o] === 1 ? "" : "s"}` }))
+}
+
+export const repoChoices = (mods: IndexMods | null, owner: string): Choice[] =>
+  Object.keys(mods || {}).filter((id) => !owner || splitId(id)[0].toLowerCase() === owner.toLowerCase())
+    .map((id) => ({ value: splitId(id)[1], label: splitId(id)[1], detail: newest(mods!, id)?.name, icon: smallIcon(newest(mods!, id)) }))
+    .sort((a, b) => a.value.localeCompare(b.value, undefined, { sensitivity: "base" }))
 export const modId = (s: State) => `${s.owner}.${s.repo}`
 export const basename = (url: string) => {
   try { return decodeURIComponent(new URL(url).pathname.split("/").pop() || "") } catch { return "" }
@@ -69,6 +109,7 @@ export function manifest(s: State) {
     manifest_version: 2, id: modId(s), name: s.name || modId(s), version: s.version,
     author: s.author || s.owner, description: s.description,
   }
+  if (s.changelog.trim()) m.changelog = s.changelog
   const icons = ICON_SIZES.filter((n) => s.icons[n]).map((n) => ({ size: n, url: s.icons[n] }))
   if (icons.length) m.icons = icons
   const shots = s.screenshots.filter(Boolean)
@@ -76,6 +117,9 @@ export function manifest(s: State) {
   m.parity_required = s.parity
   if (s.scenes.length) m.scenes = [...s.scenes]
   m.dependencies = Object.fromEntries(s.dependencies.filter((d) => d.id).map((d) => [d.id, d.version]))
+  const incompatible = s.incompatible.filter((x) => x.id)
+  if (incompatible.length) m.incompatible_with = Object.fromEntries(incompatible.map((x) =>
+    [x.id, x.below ? { note: x.note, below: x.below } : { note: x.note }]))
   m.artifacts = s.artifacts.map((a) => ({
     targets: [...a.targets],
     download_url: a.download_url,
@@ -146,6 +190,21 @@ export function problems(s: State, mods: IndexMods | null) {
     const p = versionProblem(d.version, `Dependency ${d.id}'s minimum version`)
     if (p) out.push(p)
   }
+  if (s.changelog.length > CHANGELOG_MAX) out.push(`The changelog is over ${CHANGELOG_MAX} characters.`)
+  // Mirrors incompatibility_errors in tools/modindex.py.
+  const deps = new Set(s.dependencies.map((d) => d.id.toLowerCase()))
+  for (const x of s.incompatible) {
+    if (!x.id) continue
+    const [u, r] = splitId(x.id)
+    if (!r || !USER_RE.test(u) || !REPO_RE.test(r)) out.push(`"${x.id}" under "Doesn't work with" isn't an owner.repo id.`)
+    else if (x.id.toLowerCase() === modId(s).toLowerCase()) out.push("A mod can't be listed as not working with itself.")
+    else if (mods && !(x.id in mods)) out.push(`${x.id} isn't in this repository (ids are case-sensitive), so it can't be listed as not working with this mod.`)
+    if (deps.has(x.id.toLowerCase())) out.push(`${x.id} is a dependency, so it can't also be listed as not working with this mod.`)
+    if (!x.note.trim()) out.push(`Say why ${x.id || "the mod"} doesn't work with this one.`)
+    else if (x.note.length > NOTE_MAX) out.push(`The note for ${x.id} is over ${NOTE_MAX} characters.`)
+    const p = x.below && versionProblem(x.below, `The first version of ${x.id} that works`)
+    if (p) out.push(p)
+  }
   if (s.scenes.length === SCENES.length) out.push("All scenes are ticked: untick them all instead, which means the same.")
   const claimed: Record<string, number> = {}
   m.artifacts.forEach((a, i) => {
@@ -187,9 +246,12 @@ export function loadManifest(m: any): State {
   const s: State = {
     owner: owner || "", repo: repo || "", version: m.version || "", name: m.name || "",
     author: m.author || "", description: m.description || "",
+    changelog: typeof m.changelog === "string" ? m.changelog : "",
     parity: m.parity_required !== false,
     scenes: Array.isArray(m.scenes) ? m.scenes.filter((x: string) => SCENES.some(([k]) => k === x)) : [],
     dependencies: Object.entries(m.dependencies || {}).map(([id, version]) => ({ id, version: String(version) })),
+    incompatible: Object.entries(m.incompatible_with && typeof m.incompatible_with === "object" ? m.incompatible_with : {})
+      .map(([id, x]: [string, any]) => ({ id, note: String(x?.note || ""), below: String(x?.below || "") })),
     icons: Object.fromEntries((Array.isArray(m.icons) ? m.icons : [])
       .filter((i: any) => ICON_SIZES.includes(i?.size) && typeof i.url === "string").map((i: any) => [i.size, i.url])),
     screenshots: Array.isArray(m.screenshots) ? m.screenshots.slice(0, 4) : [],
@@ -247,6 +309,7 @@ export async function fillFromRelease(link: string, mods: IndexMods | null, read
   let s: State
   if (base) {
     try { s = loadManifest(base) } catch (e) { return { status: "Couldn't read the published manifest: " + (e as Error).message } }
+    s.changelog = ""    // it described the published version
     // Each build keeps its file name, with the old version swapped for the new one.
     for (const a of s.artifacts) {
       const want = basename(a.download_url).split(base.version).join(version || base.version)
